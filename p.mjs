@@ -696,24 +696,36 @@ function rw(u){
   u=u.replace(/(?:https?:)?\\/\\/([a-z0-9][-a-z0-9.]*\\.(?:vggcdn\\.net|stubhubstatic\\.com|viagogo\\.net|viagogo\\.com))/g,'/_cdn/$1');
   return u;
 }
-/* ── Override fetch ── */
+/* ── Override fetch — locked with defineProperty so AWS WAF / polyfills can't overwrite ── */
 var OF=window.fetch;
-window.fetch=function(a,b){
+function _spudFetch(a,b){
   try{if(typeof a==='string')a=rw(a);else if(a&&a.url)a=new Request(rw(a.url),a);}catch(e){}
   var _u=typeof a==='string'?a:(a&&a.url?a.url:'');
+  var _isApi=_u.indexOf('?method=')!==-1||_u.indexOf('/api/')!==-1||_u.indexOf('graphql')!==-1;
   return OF.call(this,a,b).then(function(r){
     /* If server returned HTML for an API/XHR call, return empty JSON to prevent React crash */
     var ct=(r.headers.get('content-type')||'');
-    if(ct.indexOf('text/html')!==-1&&(_u.indexOf('?method=')!==-1||_u.indexOf('/api/')!==-1||_u.indexOf('graphql')!==-1)){
-      return new Response('{"Items":[],"TotalItems":0,"Success":true,"Data":null}',{status:200,headers:{'content-type':'application/json'}});
+    if(_isApi&&ct.indexOf('text/html')!==-1){
+      return new Response('{"Items":[],"TotalItems":0,"Success":true,"Data":[]}',{status:200,headers:{'content-type':'application/json'}});
+    }
+    /* Also catch 403 JSON captcha redirects on API calls */
+    if(_isApi&&r.status===403){
+      return new Response('{"Items":[],"TotalItems":0,"Success":true,"Data":[]}',{status:200,headers:{'content-type':'application/json'}});
     }
     return r;
   }).catch(function(err){
+    if(_isApi)return new Response('{"Items":[],"TotalItems":0,"Success":true,"Data":[]}',{status:200,headers:{'content-type':'application/json'}});
     return OF.call(window,a,b);
   }).catch(function(){
     return new Response('{}',{status:200,headers:{'content-type':'application/json'}});
   });
-};
+}
+/* Lock fetch so no other script can overwrite it */
+try{
+  Object.defineProperty(window,'fetch',{value:_spudFetch,writable:false,configurable:false});
+}catch(e){window.fetch=_spudFetch;}
+/* Re-lock on a timer in case something still manages to reset it */
+setInterval(function(){try{if(window.fetch!==_spudFetch){Object.defineProperty(window,'fetch',{value:_spudFetch,writable:false,configurable:false});}}catch(e){try{window.fetch=_spudFetch;}catch(e2){}}},200);
 /* ── Override XHR ── */
 var OO=XMLHttpRequest.prototype.open;
 XMLHttpRequest.prototype.open=function(m,u){
@@ -1940,12 +1952,33 @@ function handleMain(cReq, cRes, attempt = 0) {
           pRes.resume(); // discard 403 captcha body — useless on proxy domain
           console.log('[DD] 403 on ' + cReq.url.substring(0, 60) + ' — checking cache...');
 
-          // Try serving from cache
+          // Try serving from cache — rewrite + inject if not already processed
           const cached = getCachedHtml(cReq.url);
           if (cached) {
             console.log('[DD] serving cached page for ' + cReq.url.substring(0, 40));
+            let cachedHtml = cached.html;
+            // If cache has raw (un-rewritten) HTML, process it now
+            if (!cachedHtml.includes('_vgEventInfo') || cachedHtml.includes('https://www.viagogo.com')) {
+              console.log('[DD] rewriting raw cached HTML');
+              cachedHtml = rewriteHtml(cachedHtml);
+              cachedHtml = cachedHtml.replace(/<script[^>]*src="[^"]*(?:d6631957|crowdcontrol)[^"]*"[^>]*>(?:[\s\S]*?<\/script>)/gi, '');
+              cachedHtml = cachedHtml.replace(/<script[^>]*>[^<]*(?:d6631957|crowdcontrol\.viagogo)[^<]*<\/script>/gi, '');
+              const reqProto = (cReq.headers['x-forwarded-proto'] || '').split(',')[0].trim() || 'https';
+              cachedHtml = fixOgTags(cachedHtml, cReq.headers.host || 'localhost:3000', reqProto);
+              if (!cachedHtml.includes('_vgEventInfo')) {
+                if (/<\/body>/i.test(cachedHtml)) {
+                  cachedHtml = cachedHtml.replace(/<\/body>/i, INJECT_BLOCK + '</body>');
+                } else if (/<\/html>/i.test(cachedHtml)) {
+                  cachedHtml = cachedHtml.replace(/<\/html>/i, INJECT_BLOCK + '</html>');
+                } else {
+                  cachedHtml = cachedHtml + INJECT_BLOCK;
+                }
+              }
+              // Update cache with processed version
+              cacheHtml(cReq.url, cachedHtml, cached.headers);
+            }
             const acceptEnc = cReq.headers['accept-encoding'] || '';
-            sendCompressed(cRes, 200, { ...cached.headers, 'x-spud-cache': 'hit' }, Buffer.from(cached.html), acceptEnc);
+            sendCompressed(cRes, 200, { ...cached.headers, 'x-spud-cache': 'hit' }, Buffer.from(cachedHtml), acceptEnc);
             // Background refresh the DD cookie
             refreshDataDomeCookie();
             return;
@@ -1960,7 +1993,7 @@ function handleMain(cReq, cRes, attempt = 0) {
           if (_isApiCall) {
             // Return empty JSON — prevents React from crashing when it gets HTML instead of JSON
             console.log('[DD] API 403 → empty JSON for ' + cReq.url.substring(0, 60));
-            const emptyApi = Buffer.from('{"Items":[],"TotalItems":0,"Success":true,"Data":null}');
+            const emptyApi = Buffer.from('{"Items":[],"TotalItems":0,"Success":true,"Data":[]}');
             cRes.writeHead(200, {
               'content-type': 'application/json; charset=utf-8',
               'content-length': emptyApi.length,
@@ -1997,7 +2030,7 @@ function handleMain(cReq, cRes, attempt = 0) {
       if (pRes.statusCode === 403 && isJSON) {
         pRes.resume();
         console.log('[DD] JSON 403 → empty API for ' + cReq.url.substring(0, 60));
-        const emptyApi = Buffer.from('{"Items":[],"TotalItems":0,"Success":true,"Data":null}');
+        const emptyApi = Buffer.from('{"Items":[],"TotalItems":0,"Success":true,"Data":[]}');
         cRes.writeHead(200, {
           'content-type': 'application/json; charset=utf-8',
           'content-length': emptyApi.length,
@@ -2037,6 +2070,30 @@ function handleMain(cReq, cRes, attempt = 0) {
             else if (exMatch) _ddExpiry = new Date(exMatch[1]).getTime();
             else _ddExpiry = Date.now() + 3600000; // 1h default
           }
+        }
+      }
+
+      // ── API calls that got HTML instead of JSON (any status code) ──
+      // viagogo returns homepage HTML for API calls on unauthenticated/blocked sessions.
+      // React expects JSON → crashes. Intercept here BEFORE normal HTML processing.
+      if (isHTML) {
+        const _isApiReq = cReq.url.includes('?method=') ||
+                          cReq.url.includes('/api/') ||
+                          (cReq.headers['accept'] || '').includes('application/json') ||
+                          (cReq.headers['x-requested-with'] || '').toLowerCase() === 'xmlhttprequest' ||
+                          cReq.url.includes('graphql');
+        if (_isApiReq) {
+          pRes.resume(); // discard the HTML body
+          console.log('[API-HTML] ' + pRes.statusCode + ' HTML response for API call → empty JSON: ' + cReq.url.substring(0, 80));
+          const emptyApi = Buffer.from('{"Items":[],"TotalItems":0,"Success":true,"Data":[]}');
+          cRes.writeHead(200, {
+            'content-type': 'application/json; charset=utf-8',
+            'content-length': emptyApi.length,
+            'cache-control': 'no-store',
+            'access-control-allow-origin': '*',
+          });
+          cRes.end(emptyApi);
+          return;
         }
       }
 
